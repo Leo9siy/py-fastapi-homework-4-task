@@ -42,7 +42,7 @@ async def create_user_profile(
     if token_data.get("user_id") != user_id and not is_admin:
         raise HTTPException(status_code=403, detail="You don't have permission to edit this profile.")
 
-    user_result = await db.execute(select(UserModel).where(UserModel.id == user_id, UserModel.is_active == True))
+    user_result = await db.execute(select(UserModel).where(UserModel.id == user_id, UserModel.is_active))
     user = user_result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="User not found or not active.")
@@ -152,4 +152,3 @@ async def get_user_profile(
         raise HTTPException(status_code=404, detail="Profile not found.")
 
     return profile
-
