@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Optional
 
 from fastapi import APIRouter, Depends, status, UploadFile, File, Form, HTTPException, BackgroundTasks
 from sqlalchemy import select
@@ -17,7 +18,11 @@ from validation import validate_name, validate_gender, validate_birth_date, vali
 router = APIRouter()
 
 
-@router.post("/users/{user_id}/profile/", response_model=ProfileResponseSchema, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/users/{user_id}/profile/",
+    response_model=ProfileResponseSchema,
+    status_code=status.HTTP_201_CREATED
+)
 async def create_user_profile(
     user_id: int,
     first_name: str = Form(...),
@@ -89,13 +94,18 @@ async def create_user_profile(
     return profile
 
 
-@router.patch("/users/{user_id}/profile/", response_model=ProfileResponseSchema)
+@router.patch(
+    "/users/{user_id}/profile/",
+    response_model=ProfileResponseSchema
+)
 async def update_user_profile(
     user_id: int,
     update_data: ProfileUpdateSchema,
+    avatar: Optional[UploadFile] = File(None),
     token: str = Depends(get_token),
     db: AsyncSession = Depends(get_db),
-    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager)
+    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+    s3_client: S3StorageInterface = Depends(get_s3_storage_client)
 ):
     try:
         token_data = jwt_manager.decode_access_token(token)
@@ -114,6 +124,32 @@ async def update_user_profile(
         raise HTTPException(status_code=404, detail="Profile not found.")
 
     update_fields = update_data.dict(exclude_unset=True)
+
+    if avatar:
+        try:
+            validate_image(avatar)
+            avatar_path = await s3_client.upload_avatar(user_id, avatar)
+            profile.avatar = avatar_path
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except Exception:
+            raise HTTPException(status_code=500, detail="Failed to upload avatar.")
+
+    try:
+        if "first_name" in update_fields:
+            validate_name(update_fields["first_name"])
+        if "last_name" in update_fields:
+            validate_name(update_fields["last_name"])
+        if "gender" in update_fields:
+            validate_gender(update_fields["gender"])
+        if "date_of_birth" in update_fields:
+            validate_birth_date(update_fields["date_of_birth"])
+        if "info" in update_fields and not update_fields["info"].strip():
+            raise ValueError("Info field cannot be empty or contain only spaces.")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
     for key, value in update_fields.items():
         setattr(profile, key, value)
 
@@ -123,7 +159,10 @@ async def update_user_profile(
     return profile
 
 
-@router.get("/users/{user_id}/profile/", response_model=ProfileResponseSchema)
+@router.get(
+    "/users/{user_id}/profile/",
+    response_model=ProfileResponseSchema
+)
 async def get_user_profile(
         user_id: int,
         token: str = Depends(get_token),

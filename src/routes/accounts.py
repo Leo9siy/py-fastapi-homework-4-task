@@ -175,8 +175,10 @@ async def register_user(
     },
 )
 async def activate_account(
+        background_tasks: BackgroundTasks,
         activation_data: UserActivationRequestSchema,
         db: AsyncSession = Depends(get_db),
+        email_sender: EmailSenderInterface = Depends(get_accounts_email_notificator),
 ) -> MessageResponseSchema:
     """
     Endpoint to activate a user's account.
@@ -187,8 +189,10 @@ async def activate_account(
     or if the account is already active, an HTTP 400 error is raised.
 
     Args:
+        background_tasks: Background tasks used to create the back ground task.
         activation_data (UserActivationRequestSchema): Contains the user's email and activation token.
         db (AsyncSession): The asynchronous database session.
+        email_sender (EmailSenderInterface): The email sender used to send emails.
 
     Returns:
         MessageResponseSchema: A response message confirming successful activation.
@@ -228,6 +232,13 @@ async def activate_account(
         )
 
     user.is_active = True
+
+    background_tasks.add_task(
+        email_sender.send_activation_complete_email,
+        user.email,
+        "http://localhost:8000/accounts/login/"
+    )
+
     await db.delete(token_record)
     await db.commit()
 
@@ -248,7 +259,7 @@ async def request_password_reset_token(
         data: PasswordResetRequestSchema,
         background_tasks: BackgroundTasks,
         db: AsyncSession = Depends(get_db),
-        email_sender: EmailSenderInterface = Depends(EmailSenderInterface),
+        email_sender: EmailSenderInterface = Depends(get_accounts_email_notificator),
 ) -> MessageResponseSchema:
     """
     Endpoint to request a password reset token.
@@ -258,7 +269,9 @@ async def request_password_reset_token(
 
     Args:
         data (PasswordResetRequestSchema): The request data containing the user's email.
+        background_tasks: The background tasks used to generate a new token.
         db (AsyncSession): The asynchronous database session.
+        email_sender (EmailSenderInterface): The email sender used to generate a new token.
 
     Returns:
         MessageResponseSchema: A success message indicating that instructions will be sent.
@@ -336,7 +349,7 @@ async def reset_password(
         data: PasswordResetCompleteRequestSchema,
         background_tasks: BackgroundTasks,
         db: AsyncSession = Depends(get_db),
-        email_sender: EmailSenderInterface = Depends(EmailSenderInterface),
+        email_sender: EmailSenderInterface = Depends(get_accounts_email_notificator),
 ) -> MessageResponseSchema:
     """
     Endpoint for resetting a user's password.
@@ -346,8 +359,10 @@ async def reset_password(
 
     Args:
         data (PasswordResetCompleteRequestSchema): The request data containing the user's email,
+        background_tasks: The background tasks used to create background task.
          token, and new password.
         db (AsyncSession): The asynchronous database session.
+        email_sender (EmailSenderInterface): The email sender used to send a new token.
 
     Returns:
         MessageResponseSchema: A response message indicating successful password reset.
@@ -381,7 +396,7 @@ async def reset_password(
 
     expires_at = cast(datetime, token_record.expires_at).replace(tzinfo=timezone.utc)
     if expires_at < datetime.now(timezone.utc):
-        await db.run_sync(lambda s: s.delete(token_record))
+        await db.delete(token_record)
         await db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -392,12 +407,12 @@ async def reset_password(
         user.password = data.password
 
         background_tasks.add_task(
-            email_sender.send_password_reset_complete_email(),
+            email_sender.send_password_reset_complete_email,
             email=user.email,
             login_link="http://localhost:8000/accounts/login/"
         )
 
-        await db.run_sync(lambda s: s.delete(token_record))
+        await db.delete(token_record)
         await db.commit()
     except SQLAlchemyError:
         await db.rollback()
@@ -500,7 +515,6 @@ async def login_user(
             token=jwt_refresh_token
         )
         db.add(refresh_token)
-        await db.flush()
         await db.commit()
     except SQLAlchemyError:
         await db.rollback()
