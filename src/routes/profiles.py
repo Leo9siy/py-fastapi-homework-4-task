@@ -1,18 +1,18 @@
-from datetime import date
-from typing import Optional
+from typing import cast
 
 from fastapi import APIRouter, Depends, status, UploadFile, File, Form, HTTPException, BackgroundTasks
+from pydantic import HttpUrl
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_s3_storage_client, get_jwt_auth_manager
-from database import get_db, UserModel, UserProfileModel
-from exceptions import TokenExpiredError, InvalidTokenError
-from schemas.profiles import ProfileResponseSchema, ProfileUpdateSchema
+from database import get_db, UserModel, UserProfileModel, UserGroupEnum, UserGroupModel
+from database.models.accounts import GenderEnum
+from exceptions import S3FileUploadError, BaseSecurityError
+from schemas.profiles import ProfileResponseSchema, ProfileCreateSchema
 from security.http import get_token
 from security.interfaces import JWTAuthManagerInterface
 from storages import S3StorageInterface
-from validation import validate_name, validate_gender, validate_birth_date, validate_image
 
 
 router = APIRouter()
@@ -21,172 +21,117 @@ router = APIRouter()
 @router.post(
     "/users/{user_id}/profile/",
     response_model=ProfileResponseSchema,
+    summary="Create user profile",
     status_code=status.HTTP_201_CREATED
 )
-async def create_user_profile(
-    user_id: int,
-    first_name: str = Form(...),
-    last_name: str = Form(...),
-    gender: str = Form(...),
-    date_of_birth: date = Form(...),
-    info: str = Form(...),
-    avatar: UploadFile = File(...),
-    token: str = Depends(get_token),
-    db: AsyncSession = Depends(get_db),
-    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
-    s3_client: S3StorageInterface = Depends(get_s3_storage_client)
-):
-    try:
-        token_data = jwt_manager.decode_access_token(token)
-    except TokenExpiredError:
-        raise HTTPException(status_code=401, detail="Token has expired.")
-    except InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token.")
-
-    is_admin = token_data.get("group") == "admin"
-    if token_data.get("user_id") != user_id and not is_admin:
-        raise HTTPException(status_code=403, detail="You don't have permission to edit this profile.")
-
-    user_result = await db.execute(select(UserModel).where(UserModel.id == user_id, UserModel.is_active))
-    user = user_result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found or not active.")
-
-    profile_result = await db.execute(select(UserProfileModel).where(UserProfileModel.user_id == user_id))
-    existing_profile = profile_result.scalar_one_or_none()
-    if existing_profile:
-        raise HTTPException(status_code=400, detail="User already has a profile.")
-
-    try:
-        validate_name(first_name)
-        validate_name(last_name)
-        validate_gender(gender)
-        validate_birth_date(date_of_birth)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    if not info.strip():
-        raise HTTPException(status_code=422, detail="Info field cannot be empty or contain only spaces.")
-
-    try:
-        validate_image(avatar)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    try:
-        avatar_path = await s3_client.upload_avatar(user_id, avatar)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to upload avatar. Please try again later.")
-
-    profile = UserProfileModel(
-        user_id=user_id,
-        first_name=first_name.lower(),
-        last_name=last_name.lower(),
-        gender=gender,
-        date_of_birth=date_of_birth,
-        info=info,
-        avatar=avatar_path
-    )
-    db.add(profile)
-    await db.commit()
-    await db.refresh(profile)
-
-    return profile
-
-
-@router.patch(
-    "/users/{user_id}/profile/",
-    response_model=ProfileResponseSchema
-)
-async def update_user_profile(
-    user_id: int,
-    update_data: ProfileUpdateSchema,
-    avatar: Optional[UploadFile] = File(None),
-    token: str = Depends(get_token),
-    db: AsyncSession = Depends(get_db),
-    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
-    s3_client: S3StorageInterface = Depends(get_s3_storage_client)
-):
-    try:
-        token_data = jwt_manager.decode_access_token(token)
-    except jwt_manager.TokenExpiredError:
-        raise HTTPException(status_code=401, detail="Token has expired.")
-    except jwt_manager.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token.")
-
-    is_admin = token_data.get("group") == "admin"
-    if token_data.get("user_id") != user_id and not is_admin:
-        raise HTTPException(status_code=403, detail="You don't have permission to edit this profile.")
-
-    result = await db.execute(select(UserProfileModel).where(UserProfileModel.user_id == user_id))
-    profile = result.scalar_one_or_none()
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found.")
-
-    update_fields = update_data.dict(exclude_unset=True)
-
-    if avatar:
-        try:
-            validate_image(avatar)
-            avatar_path = await s3_client.upload_avatar(user_id, avatar)
-            profile.avatar = avatar_path
-        except ValueError as e:
-            raise HTTPException(status_code=422, detail=str(e))
-        except Exception:
-            raise HTTPException(status_code=500, detail="Failed to upload avatar.")
-
-    try:
-        if "first_name" in update_fields:
-            validate_name(update_fields["first_name"])
-        if "last_name" in update_fields:
-            validate_name(update_fields["last_name"])
-        if "gender" in update_fields:
-            validate_gender(update_fields["gender"])
-        if "date_of_birth" in update_fields:
-            validate_birth_date(update_fields["date_of_birth"])
-        if "info" in update_fields and not update_fields["info"].strip():
-            raise ValueError("Info field cannot be empty or contain only spaces.")
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    for key, value in update_fields.items():
-        setattr(profile, key, value)
-
-    await db.commit()
-    await db.refresh(profile)
-
-    return profile
-
-
-@router.get(
-    "/users/{user_id}/profile/",
-    response_model=ProfileResponseSchema
-)
-async def get_user_profile(
+async def create_profile(
         user_id: int,
         token: str = Depends(get_token),
+        jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
         db: AsyncSession = Depends(get_db),
-        jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager)
-):
+        s3_client: S3StorageInterface = Depends(get_s3_storage_client),
+        profile_data: ProfileCreateSchema = Depends(ProfileCreateSchema.from_form)
+) -> ProfileResponseSchema:
+    """
+    Creates a user profile.
+
+    Steps:
+    - Validate user authentication token.
+    - Check if the user already has a profile.
+    - Upload avatar to S3 storage.
+    - Store profile details in the database.
+
+    Args:
+        user_id (int): The ID of the user for whom the profile is being created.
+        token (str): The authentication token.
+        jwt_manager (JWTAuthManagerInterface): JWT manager for decoding tokens.
+        db (AsyncSession): The asynchronous database session.
+        s3_client (S3StorageInterface): The asynchronous S3 storage client.
+        profile_data (ProfileCreateSchema): The profile data from the form.
+
+    Returns:
+        ProfileResponseSchema: The created user profile details.
+
+    Raises:
+        HTTPException: If authentication fails, if the user is not found or inactive,
+                       or if the profile already exists, or if S3 upload fails.
+    """
     try:
-        token_data = jwt_manager.decode_access_token(token)
-    except TokenExpiredError:
-        raise HTTPException(status_code=401, detail="Token has expired.")
-    except InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token.")
+        payload = jwt_manager.decode_access_token(token)
+        token_user_id = payload.get("user_id")
+    except BaseSecurityError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(e)
+        )
 
-    if token_data is None:
-        raise HTTPException(status_code=401, detail="Token has expired.")
+    if user_id != token_user_id:
+        stmt = (
+            select(UserGroupModel)
+            .join(UserModel)
+            .where(UserModel.id == token_user_id)
+        )
+        result = await db.execute(stmt)
+        user_group = result.scalars().first()
+        if not user_group or user_group.name == UserGroupEnum.USER:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to edit this profile."
+            )
 
-    is_admin = token_data.get("group") == "admin"
+    stmt = select(UserModel).where(UserModel.id == user_id)
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found or not active."
+        )
 
-    if token_data.get("user_id") != user_id and not is_admin:
-        raise HTTPException(status_code=403, detail="You don't have permission to view this profile.")
+    stmt_profile = select(UserProfileModel).where(UserProfileModel.user_id == user.id)
+    result_profile = await db.execute(stmt_profile)
+    existing_profile = result_profile.scalars().first()
+    if existing_profile:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User already has a profile."
+        )
 
-    result = await db.execute(select(UserProfileModel).where(UserProfileModel.user_id == user_id))
-    profile = result.scalar_one_or_none()
+    avatar_bytes = await profile_data.avatar.read()
+    avatar_key = f"avatars/{user.id}_{profile_data.avatar.filename}"
 
-    if profile is None:
-        raise HTTPException(status_code=404, detail="Profile not found.")
+    try:
+        await s3_client.upload_file(file_name=avatar_key, file_data=avatar_bytes)
+    except S3FileUploadError as e:
+        print(f"Error uploading avatar to S3: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to upload avatar. Please try again later."
+        )
 
-    return profile
+    new_profile = UserProfileModel(
+        user_id=cast(int, user.id),
+        first_name=profile_data.first_name,
+        last_name=profile_data.last_name,
+        gender=cast(GenderEnum, profile_data.gender),
+        date_of_birth=profile_data.date_of_birth,
+        info=profile_data.info,
+        avatar=avatar_key
+    )
+
+    db.add(new_profile)
+    await db.commit()
+    await db.refresh(new_profile)
+
+    avatar_url = await s3_client.get_file_url(new_profile.avatar)
+
+    return ProfileResponseSchema(
+        id=new_profile.id,
+        user_id=new_profile.user_id,
+        first_name=new_profile.first_name,
+        last_name=new_profile.last_name,
+        gender=new_profile.gender,
+        date_of_birth=new_profile.date_of_birth,
+        info=new_profile.info,
+        avatar=cast(HttpUrl, avatar_url)
+    )
