@@ -129,7 +129,13 @@ async def register_user(
 
         await db.commit()
         await db.refresh(new_user)
-
+    except SQLAlchemyError as e:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred during user creation."
+        ) from e
+    else:
         activation_link = f"http://localhost:8000/accounts/activate/{activation_token.token}/"
 
         background_tasks.add_task(
@@ -138,13 +144,6 @@ async def register_user(
             activation_link
         )
 
-    except SQLAlchemyError as e:
-        await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred during user creation."
-        ) from e
-    else:
         return UserRegistrationResponseSchema.model_validate(new_user)
 
 
@@ -299,7 +298,7 @@ async def request_password_reset_token(
     background_tasks.add_task(
         email_sender.send_password_reset_email,
         user.email,
-        reset_link=f"http://localhost:8000/accounts/reset-password/complete/{reset_token.token}",
+        reset_link="http://localhost:8000/accounts/reset-password/complete/",
     )
 
     return MessageResponseSchema(
@@ -410,13 +409,6 @@ async def reset_password(
 
     try:
         user.password = data.password
-
-        background_tasks.add_task(
-            email_sender.send_password_reset_complete_email,
-            email=user.email,
-            login_link="http://localhost:8000/accounts/login/"
-        )
-
         await db.delete(token_record)
         await db.commit()
     except SQLAlchemyError:
@@ -425,6 +417,12 @@ async def reset_password(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred while resetting the password."
         )
+
+    background_tasks.add_task(
+        email_sender.send_password_reset_complete_email,
+        email=user.email,
+        login_link="http://localhost:8000/accounts/login/"
+    )
 
     return MessageResponseSchema(message="Password reset successfully.")
 
