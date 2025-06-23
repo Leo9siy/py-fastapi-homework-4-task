@@ -149,7 +149,6 @@ async def update_user_profile(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-
     for key, value in update_fields.items():
         setattr(profile, key, value)
 
